@@ -1,9 +1,9 @@
 streamlit
 pandas
-sqlalchemy
-psycopg2-binary
-spacy
 pdfplumber
 python-docx
-sentence-transformers
+spacy
 nltk
+sentence-transformers
+supabase
+python-dotenv
