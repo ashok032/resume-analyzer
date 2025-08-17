@@ -6,230 +6,261 @@ import pdfplumber
 import docx
 import re
 import spacy
-import nltk
-from sentence_transformers import SentenceTransformer, util
+import json
+import smtplib
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 from datetime import datetime
 from job_descriptions import job_descriptions
-from supabase import create_client, Client
+from sentence_transformers import SentenceTransformer, util
+from supabase import create_client
+from dotenv import load_dotenv
 
-# ----------------- SUPABASE CONFIG -----------------
-supabase_url = st.secrets["SUPABASE_URL"]
-supabase_key = st.secrets["SUPABASE_KEY"]
-supabase: Client = create_client(supabase_url, supabase_key)
+# ------------------- LOAD ENV VARIABLES -------------------
+load_dotenv()
+supabase_url = os.getenv("SUPABASE_URL")
+supabase_key = os.getenv("SUPABASE_KEY")
+supabase = create_client(supabase_url, supabase_key)
 
-# ----------------- PASSWORD HASHING -----------------
+# ------------------- LOAD MODELS -------------------
+nlp = spacy.load("en_core_web_sm")   # ✅ fixed model load
+model = SentenceTransformer("all-MiniLM-L6-v2")
+
+# ------------------- HELPER FUNCTIONS -------------------
 def hash_password(password):
     return hashlib.sha256(password.encode()).hexdigest()
 
-# ----------------- LOAD SPACY MODEL -----------------
-try:
-    import en_core_web_sm
-    nlp = en_core_web_sm.load()
-except:
-    nlp = spacy.load("en_core_web_sm")
-
-# ----------------- LOAD NLTK -----------------
-nltk.download("punkt", quiet=True)
-nltk.download("stopwords", quiet=True)
-from nltk.corpus import stopwords
-from nltk.tokenize import word_tokenize
-
-# ----------------- EMBEDDING MODEL -----------------
-embedder = SentenceTransformer("all-MiniLM-L6-v2")
-
-# ----------------- RESUME PARSER -----------------
 def extract_text_from_pdf(file):
+    text = ""
     with pdfplumber.open(file) as pdf:
-        return " ".join([page.extract_text() or "" for page in pdf.pages])
+        for page in pdf.pages:
+            text += page.extract_text() + "\n"
+    return text
 
 def extract_text_from_docx(file):
     doc = docx.Document(file)
-    return " ".join([para.text for para in doc.paragraphs])
+    return "\n".join([para.text for para in doc.paragraphs])
 
-def parse_resume(file):
-    if file.name.endswith(".pdf"):
-        text = extract_text_from_pdf(file)
-    elif file.name.endswith(".docx"):
-        text = extract_text_from_docx(file)
+def extract_resume_text(uploaded_file):
+    if uploaded_file.name.endswith(".pdf"):
+        return extract_text_from_pdf(uploaded_file)
+    elif uploaded_file.name.endswith(".docx"):
+        return extract_text_from_docx(uploaded_file)
     else:
-        return None, None, None, ""
+        return ""
 
+def extract_name_email_phone(text):
     doc = nlp(text)
-
-    # Extract name (first PERSON entity or first line fallback)
     name = None
+    email = None
+    phone = None
+
+    # Extract Name (first PERSON entity or heuristic)
     for ent in doc.ents:
         if ent.label_ == "PERSON":
-            name = ent.text
+            name = ent.text.strip()
             break
+
     if not name:
-        name = text.split("\n")[0].strip()
+        first_line = text.strip().split("\n")[0]
+        if first_line.isupper() or len(first_line.split()) <= 4:
+            name = first_line.strip()
 
-    # Extract email
-    email = re.search(r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+", text)
-    email = email.group(0) if email else None
+    # Extract Email
+    email_match = re.search(r"[\w\.-]+@[\w\.-]+\.\w+", text)
+    if email_match:
+        email = email_match.group(0)
 
-    # Extract phone
-    phone = re.search(r"(\+?\d{1,3}[-.\s]?)?\d{10}", text)
-    phone = phone.group(0) if phone else None
+    # Extract Phone
+    phone_match = re.search(r"\+?\d[\d -]{8,}\d", text)
+    if phone_match:
+        phone = phone_match.group(0)
 
-    return name, email, phone, text
+    return name, email, phone
 
-# ----------------- SKILL EXTRACTION -----------------
-def extract_keywords(text):
-    tokens = word_tokenize(text.lower())
-    stop_words = set(stopwords.words("english"))
-    return list(set([word for word in tokens if word.isalpha() and word not in stop_words]))
+def match_resume_to_job(resume_text, jd_skills):
+    resume_doc = nlp(resume_text.lower())
+    resume_tokens = list(set([token.lemma_ for token in resume_doc if not token.is_stop and token.is_alpha]))
 
-def match_resume_to_job(resume_keywords, jd_skills):
-    resume_embeddings = embedder.encode(resume_keywords, convert_to_tensor=True)
-    jd_embeddings = embedder.encode(jd_skills, convert_to_tensor=True)
+    jd_embeddings = model.encode(jd_skills, convert_to_tensor=True)
+    resume_embeddings = model.encode(resume_tokens, convert_to_tensor=True)
 
-    matches, missing = [], []
-    for skill, jd_emb in zip(jd_skills, jd_embeddings):
-        cos_sim = util.cos_sim(jd_emb, resume_embeddings).max().item()
-        if cos_sim > 0.6:
-            matches.append(skill)
+    cosine_scores = util.cos_sim(resume_embeddings, jd_embeddings)
+    matched = []
+    missing = []
+
+    for i, skill in enumerate(jd_skills):
+        scores = cosine_scores[:, i]
+        best_score = float(scores.max())
+        if best_score > 0.6:
+            matched.append(skill)
         else:
             missing.append(skill)
 
-    score = round((len(matches) / len(jd_skills)) * 100, 2) if jd_skills else 0
-    return matches, missing, score
+    score = round((len(matched) / len(jd_skills)) * 100, 2) if jd_skills else 0
+    return matched, missing, score
 
-# ----------------- APPLICATION PHASE -----------------
-def get_next_phase(current_phase, result):
-    if result == "Fail":
-        return "Rejected"
-    if current_phase == "Applied":
-        return "Round 1"
-    if current_phase == "Round 1":
-        return "Round 2"
-    if current_phase == "Round 2":
-        return "Final"
-    if current_phase == "Final":
-        return "Selected"
-    return current_phase
+def send_email(to_email, subject, body):
+    try:
+        sender_email = os.getenv("EMAIL_USER")
+        sender_pass = os.getenv("EMAIL_PASS")
+        smtp_server = "smtp.gmail.com"
+        smtp_port = 587
 
-# ----------------- AUTHENTICATION -----------------
-USERS_FILE = "users.csv"
-if not os.path.exists(USERS_FILE):
-    pd.DataFrame(columns=["email", "password", "role"]).to_csv(USERS_FILE, index=False)
+        msg = MIMEMultipart()
+        msg["From"] = sender_email
+        msg["To"] = to_email
+        msg["Subject"] = subject
+        msg.attach(MIMEText(body, "plain"))
 
-def load_users():
-    return pd.read_csv(USERS_FILE)
+        server = smtplib.SMTP(smtp_server, smtp_port)
+        server.starttls()
+        server.login(sender_email, sender_pass)
+        server.send_message(msg)
+        server.quit()
+    except Exception as e:
+        print("Email send failed:", e)
 
-def save_user(email, password, role):
-    users = load_users()
-    if email in users["email"].values:
-        return False
-    new_user = pd.DataFrame([[email, hash_password(password), role]], columns=["email", "password", "role"])
-    users = pd.concat([users, new_user], ignore_index=True)
-    users.to_csv(USERS_FILE, index=False)
-    return True
+def save_application(email, role, name, score, phase="Applied"):
+    supabase.table("applications").upsert({
+        "email": email,
+        "role": role,
+        "name": name,
+        "score": score,
+        "phase": phase,
+        "updated_at": datetime.utcnow().isoformat()
+    }).execute()
 
-def authenticate(email, password):
-    users = load_users()
-    user = users[(users["email"] == email) & (users["password"] == hash_password(password))]
-    if not user.empty:
-        return user.iloc[0]["role"]
-    return None
+def get_applications(email=None):
+    if email:
+        return supabase.table("applications").select("*").eq("email", email).execute().data
+    return supabase.table("applications").select("*").execute().data
 
-# ----------------- STREAMLIT APP -----------------
+def update_phase(email, role, new_phase):
+    supabase.table("applications").update({"phase": new_phase}).eq("email", email).eq("role", role).execute()
+
+# ------------------- STREAMLIT UI -------------------
 st.set_page_config(page_title="AI Resume Analyzer", layout="wide")
 
 if "logged_in" not in st.session_state:
     st.session_state.logged_in = False
+if "role" not in st.session_state:
     st.session_state.role = None
+if "email" not in st.session_state:
     st.session_state.email = None
 
-if not st.session_state.logged_in:
-    st.title("🔐 Resume Analyzer Login")
+# Sidebar for login info
+with st.sidebar:
+    if st.session_state.logged_in:
+        st.write(f"👤 Logged in as: {st.session_state.email}")
+        if st.button("Logout"):
+            st.session_state.logged_in = False
+            st.session_state.role = None
+            st.session_state.email = None
+            st.rerun()
 
-    tab1, tab2 = st.tabs(["Login", "Register"])
-    with tab1:
-        email = st.text_input("Email")
-        password = st.text_input("Password", type="password")
+# Login & Registration
+if not st.session_state.logged_in:
+    tabs = st.tabs(["Login", "Register"])
+
+    with tabs[0]:
+        st.subheader("Login")
+        email = st.text_input("Email", key="login_email")
+        password = st.text_input("Password", type="password", key="login_pass")
         if st.button("Login"):
-            role = authenticate(email, password)
-            if role:
+            res = supabase.table("users").select("*").eq("email", email).execute()
+            if res.data and res.data[0]["password"] == hash_password(password):
                 st.session_state.logged_in = True
-                st.session_state.role = role
+                st.session_state.role = res.data[0]["role"]
                 st.session_state.email = email
+                st.success("Login successful!")
                 st.rerun()
             else:
                 st.error("Invalid credentials")
 
-    with tab2:
-        email = st.text_input("New Email")
-        password = st.text_input("New Password", type="password")
-        role = st.selectbox("Role", ["User", "HR"])
+    with tabs[1]:
+        st.subheader("Register")
+        email = st.text_input("Email", key="reg_email")
+        password = st.text_input("Password", type="password", key="reg_pass")
+        role = st.selectbox("Role", ["User", "HR"], key="reg_role")
         if st.button("Register"):
-            if save_user(email, password, role):
-                st.success("User registered! Please login.")
+            res = supabase.table("users").select("*").eq("email", email).execute()
+            if res.data:
+                st.error("Email already registered.")
             else:
-                st.error("Email already exists.")
+                supabase.table("users").insert({
+                    "email": email,
+                    "password": hash_password(password),
+                    "role": role
+                }).execute()
+                st.success("Registration successful! Please login.")
 
 else:
-    st.sidebar.write(f"👤 Logged in as {st.session_state.email} ({st.session_state.role})")
-    if st.sidebar.button("Logout"):
-        st.session_state.logged_in = False
-        st.rerun()
+    # --------- USER VIEW ---------
+    if st.session_state.role == "User":
+        st.header("📄 Candidate Dashboard")
 
-    st.title("📄 AI Resume Analyzer")
-
-    # ----------------- HR VIEW -----------------
-    if st.session_state.role == "HR":
-        st.subheader("👔 HR Dashboard")
-
+        uploaded_file = st.file_uploader("Upload your Resume (PDF/DOCX)", type=["pdf", "docx"])
         job_role = st.selectbox("Select Job Role", list(job_descriptions.keys()))
-        uploaded_file = st.file_uploader("Upload Resume", type=["pdf", "docx"])
 
-        if uploaded_file:
-            name, email, phone, text = parse_resume(uploaded_file)
-            resume_keywords = extract_keywords(text)
+        if uploaded_file and job_role:
+            resume_text = extract_resume_text(uploaded_file)
+            name, email, phone = extract_name_email_phone(resume_text)
             jd_skills = job_descriptions[job_role]["skills"]
-            matched, missing, score = match_resume_to_job(resume_keywords, jd_skills)
+            matched, missing, score = match_resume_to_job(resume_text, jd_skills)
 
-            st.write(f"**Candidate:** {name}")
+            st.subheader("Analysis Result")
+            st.write(f"**Name:** {name}")
             st.write(f"**Email:** {email}")
             st.write(f"**Phone:** {phone}")
             st.write(f"**Match Score:** {score}%")
+            st.success(f"✅ Matched Skills: {', '.join(matched)}")
+            st.error(f"❌ Missing Skills: {', '.join(missing)}")
 
-            # Save to Supabase
-            data = {
-                "name": name,
-                "email": email,
-                "job_role": job_role,
-                "score": score,
-                "phase": "Round 1" if score > 70 else "Rejected",
-                "submitted_at": datetime.now().isoformat()
-            }
-            supabase.table("applications").insert(data).execute()
-            st.success(f"Application saved! Phase: {data['phase']}")
+            save_application(email, job_role, name, score)
 
-        st.subheader("📋 Manage Applications")
-        apps = supabase.table("applications").select("*").execute().data
-        if apps:
-            df = pd.DataFrame(apps)
-            st.dataframe(df)
+        st.subheader("📊 Your Applications")
+        apps = get_applications(st.session_state.email)
+        for app in apps:
+            st.write(f"**Role:** {app['role']} | **Score:** {app['score']}% | **Phase:** {app['phase']}")
 
-            for idx, row in df.iterrows():
-                st.write(f"{row['name']} ({row['job_role']}) - {row['phase']}")
-                if row["phase"] not in ["Rejected", "Selected"]:
-                    result = st.radio(f"Result for {row['name']} in {row['phase']}", ["Pending", "Pass", "Fail"], key=f"{idx}")
-                    if st.button(f"Update {row['name']}", key=f"btn_{idx}"):
-                        new_phase = get_next_phase(row["phase"], result)
-                        supabase.table("applications").update({"phase": new_phase}).eq("id", row["id"]).execute()
-                        st.success(f"Updated {row['name']} → {new_phase}")
-                        st.rerun()
+    # --------- HR VIEW ---------
+    elif st.session_state.role == "HR":
+        st.header("🧑‍💼 HR Dashboard")
 
-    # ----------------- USER VIEW -----------------
-    elif st.session_state.role == "User":
-        st.subheader("🙋 Candidate Dashboard")
-        email = st.session_state.email
-        apps = supabase.table("applications").select("*").eq("email", email).execute().data
-        if apps:
-            df = pd.DataFrame(apps)
-            st.dataframe(df[["job_role", "score", "phase", "submitted_at"]])
-        else:
-            st.info("No applications found. Please ask HR to upload your resume.")
+        apps = get_applications()
+        df = pd.DataFrame(apps)
+        st.dataframe(df)
+
+        for app in apps:
+            st.write(f"### {app['name']} - {app['role']}")
+            st.write(f"📧 {app['email']} | Score: {app['score']}% | Phase: {app['phase']}")
+
+            if app["phase"] == "Applied" and app["score"] > 70:
+                if st.button(f"Schedule Round 1 for {app['email']}", key=f"r1_{app['email']}"):
+                    update_phase(app["email"], app["role"], "Round 1")
+                    send_email(app["email"], "Interview Scheduled - Round 1", "Congratulations! You have been shortlisted for Round 1 interview.")
+                    st.success("Round 1 scheduled!")
+
+            elif app["phase"] in ["Round 1", "Round 2"]:
+                decision = st.radio(f"Decision for {app['email']} ({app['phase']})", ["Pending", "Pass", "Fail"], key=f"dec_{app['email']}")
+                if decision == "Pass":
+                    next_phase = "Round 2" if app["phase"] == "Round 1" else "Final"
+                    update_phase(app["email"], app["role"], next_phase)
+                    send_email(app["email"], f"Interview Scheduled - {next_phase}", f"Congratulations! You have been shortlisted for {next_phase}.")
+                    st.success(f"Moved to {next_phase}")
+                elif decision == "Fail":
+                    update_phase(app["email"], app["role"], "Rejected")
+                    send_email(app["email"], "Application Update", "We regret to inform you that your application has been rejected.")
+                    st.error("Candidate Rejected")
+
+            elif app["phase"] == "Final":
+                decision = st.radio(f"Final Decision for {app['email']}", ["Pending", "Offer", "Reject"], key=f"final_{app['email']}")
+                if decision == "Offer":
+                    update_phase(app["email"], app["role"], "Selected")
+                    send_email(app["email"], "Congratulations!", "You have been selected for the role!")
+                    st.success("Offer Sent")
+                elif decision == "Reject":
+                    update_phase(app["email"], app["role"], "Rejected")
+                    send_email(app["email"], "Application Update", "We regret to inform you that your application has been rejected.")
+                    st.error("Candidate Rejected")
