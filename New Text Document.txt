@@ -1,1 +1,0 @@
-postgresql://resume_analyzer_db_t49r_user:hSyhHAYyVKFC42vnmlroMOzpBZWG9GEt@dpg-d2g67b8dl3ps73eu112g-a.oregon postgres.render.com/resume_analyzer_db_t49r
