@@ -7,22 +7,20 @@ numpy==1.26.4
 pdfplumber==0.11.0
 python-docx==1.1.2
 spacy==3.7.2
-
-# Pre-load spacy model (so Streamlit Cloud doesn’t download at runtime)
-https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.7.1/en_core_web_sm-3.7.1-py3-none-any.whl
+en-core-web-sm==3.7.1
 
 # Text processing
 nltk==3.8.1
 regex==2024.5.15
 
-# Embeddings & semantic similarity
+# Embeddings & semantic similarity (CPU-only torch to avoid huge CUDA builds)
 sentence-transformers==2.7.0
+torch==2.2.2+cpu
+torchvision==0.17.2+cpu
+--extra-index-url https://download.pytorch.org/whl/cpu
 
 # Database (Supabase)
 supabase==2.5.0
-
-# Email utils
-smtplib-client==0.1.0
 
 # Misc
 scikit-learn==1.5.1
