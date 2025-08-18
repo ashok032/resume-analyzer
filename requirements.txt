@@ -3,8 +3,6 @@ pandas
 pdfplumber
 python-docx
 spacy==3.8.2
-nltk
 sentence-transformers
 supabase
-python-dotenv
-en-core-web-sm==3.8.0
+https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl
