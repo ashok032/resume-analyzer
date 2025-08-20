@@ -9,6 +9,7 @@ import re
 import spacy
 import smtplib
 import io
+import nltk
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
@@ -16,6 +17,25 @@ from email import encoders
 from datetime import datetime
 from supabase import create_client, Client
 from match_skills import extract_keywords, match_resume_to_job # Your custom matching logic file
+
+# -------------------- NLTK DATA DOWNLOAD --------------------
+# This function checks for and downloads necessary NLTK data packages.
+# It's placed at the top to run once when the app starts.
+@st.cache_resource
+def download_nltk_data():
+    """Downloads NLTK 'stopwords' and 'punkt' corpora if not already present."""
+    try:
+        nltk.data.find('corpora/stopwords')
+    except LookupError:
+        st.write("Downloading NLTK 'stopwords'...")
+        nltk.download('stopwords')
+    try:
+        nltk.data.find('tokenizers/punkt')
+    except LookupError:
+        st.write("Downloading NLTK 'punkt'...")
+        nltk.download('punkt')
+
+download_nltk_data()
 
 # -------------------- CONFIG AND INITIALIZATION --------------------
 st.set_page_config(page_title="AI Resume Analyzer", layout="wide", initial_sidebar_state="auto")
