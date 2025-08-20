@@ -4,16 +4,8 @@ pdfplumber
 python-docx
 sqlalchemy
 psycopg2-binary
-
-Pin numpy to a stable version to resolve spacy/thinc conflict
 numpy==1.26.4
-
-Add the missing libraries for skill matching
 sentence-transformers
 torch
-
-Use a recent stable version of spacy
 spacy==3.7.2
-
-Direct link to the compatible spacy model
 https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.7.0/en_core_web_sm-3.7.0-py3-none-any.whl
