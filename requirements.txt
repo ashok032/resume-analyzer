@@ -10,3 +10,4 @@ supabase
 sentence-transformers
 torch
 torchvision
+nltk
