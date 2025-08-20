@@ -16,6 +16,7 @@ from email.mime.base import MIMEBase
 from email import encoders
 from datetime import datetime
 from supabase import create_client, Client
+from sentence_transformers import SentenceTransformer
 from match_skills import extract_keywords, match_resume_to_job # Your custom matching logic file
 
 # -------------------- NLTK DATA DOWNLOAD --------------------
@@ -50,7 +51,14 @@ def load_spacy_model():
         st.error("spaCy model not found. Please ensure 'en_core_web_sm' is listed in your requirements.txt.")
         st.stop()
 
+# Cache the SentenceTransformer model to prevent re-downloading
+@st.cache_resource
+def load_sentence_transformer_model():
+    """Load and cache the SentenceTransformer model."""
+    return SentenceTransformer('all-MiniLM-L6-v2')
+
 nlp = load_spacy_model()
+model = load_sentence_transformer_model()
 
 # Initialize Supabase connection using secrets
 try:
@@ -239,7 +247,7 @@ def user_view():
             
             resume_keywords = extract_keywords(text)
             jd_skills = job_descriptions_dict[job_role]
-            matched, missing, score = match_resume_to_job(resume_keywords, jd_skills)
+            matched, missing, score = match_resume_to_job(resume_keywords, jd_skills, model)
 
             st.markdown(f"**Analysis Complete for '{job_role}' role:**")
             st.metric(label="Match Score", value=f"{score:.2f}%")
