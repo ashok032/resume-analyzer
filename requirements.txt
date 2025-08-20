@@ -5,6 +5,9 @@ python-docx
 sqlalchemy
 psycopg2-binary
 
+# Pin numpy to a stable version to resolve spacy/thinc conflict
+numpy==1.26.4
+
 # Use a recent stable version of spacy
 spacy>=3.7.0,<3.8.0
 
