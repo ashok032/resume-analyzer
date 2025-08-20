@@ -1,352 +1,316 @@
-# app.py
-import io
-import uuid
-from datetime import datetime
-
 import streamlit as st
-from supabase import create_client, Client
+import pandas as pd
+import hashlib
+import os
+import pdfplumber
+import docx
+import re
+import spacy
+import smtplib
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.mime.base import MIMEBase
+from email import encoders
+from datetime import datetime, timedelta
+from job_descriptions import job_descriptions
+from match_skills import extract_keywords, match_resume_to_job
 
-# ---- CONFIG ----
-st.set_page_config(page_title="Resume Analyzer", page_icon="🧾", layout="wide")
+# Import the new database modules
+from database import SessionLocal, User, CandidateProgress, init_db
+import sqlalchemy
 
-REQUIRED_SECRETS = ["SUPABASE_URL", "SUPABASE_ANON_KEY"]
-missing = [k for k in REQUIRED_SECRETS if k not in st.secrets]
-if missing:
-    st.error(
-        f"Missing Streamlit secrets: {missing}. "
-        "In Streamlit Cloud, go to App → Settings → Secrets and add:\n\n"
-        "SUPABASE_URL = 'https://xxxx.supabase.co'\n"
-        "SUPABASE_ANON_KEY = 'eyJ...'"
-    )
+# -------------------- CONFIG --------------------
+st.set_page_config(page_title="AI Resume Analyzer", layout="wide")
+
+# Securely load secrets from environment variables (will be set in Streamlit Cloud)
+SMTP_EMAIL = os.environ.get("SMTP_EMAIL")
+SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD")
+
+# Load the spaCy model
+try:
+    nlp = spacy.load("en_core_web_sm")
+except OSError:
+    st.error("spaCy model not found. Please ensure it's installed and listed in requirements.txt.")
     st.stop()
 
-SUPABASE_URL = st.secrets["SUPABASE_URL"]
-SUPABASE_ANON_KEY = st.secrets["SUPABASE_ANON_KEY"]
+# Initialize the database connection and create tables if they don't exist
+try:
+    init_db()
+except Exception as e:
+    st.error(f"Error connecting to the database. Please check your DATABASE_URL secret. Details: {e}")
+    st.stop()
 
-def get_client() -> Client:
-    # One global client (no DB driver)
-    return create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
-
-sb = get_client()
-
-# ---- SIMPLE PIPELINE / CONSTANTS ----
-PIPELINE = ["Applied", "Screening", "Manager Review", "Interview", "Offer", "Hired", "Rejected"]
-ADVANCE_TARGET = {i: PIPELINE[i+1] for i in range(len(PIPELINE)-2)}  # everything before Rejected
-ADVANCE_TARGET["Offer"] = "Hired"
-
-# ---- UTIL: TEXT EXTRACTION (pure Python deps) ----
-def extract_text_from_file(uploaded_file) -> str:
-    name = uploaded_file.name.lower()
-    data = uploaded_file.read()
-    if name.endswith(".pdf"):
-        try:
-            from PyPDF2 import PdfReader
-            reader = PdfReader(io.BytesIO(data))
-            return "\n".join(p.extract_text() or "" for p in reader.pages)
-        except Exception:
-            return ""
-    elif name.endswith(".docx"):
-        try:
-            import docx
-            doc = docx.Document(io.BytesIO(data))
-            return "\n".join(p.text for p in doc.paragraphs)
-        except Exception:
-            return ""
-    elif name.endswith(".txt"):
-        return data.decode(errors="ignore")
-    else:
-        return ""
-
-def simple_match_score(resume_text: str, job_text: str) -> float:
-    # Very naive: keyword overlap ratio
-    r = set(w.lower() for w in resume_text.split())
-    j = set(w.lower() for w in job_text.split())
-    if not r or not j:
-        return 0.0
-    overlap = len(r & j)
-    return round(100.0 * overlap / max(1, len(j)), 2)
-
-# ---- AUTH & SESSION ----
-if "auth" not in st.session_state:
-    st.session_state.auth = None   # dict: {user_id, email, role, access_token}
-
-def sign_in(email: str, password: str):
+# -------------------- New Database Helper Functions --------------------
+def load_users():
+    """Loads all users from the database into a pandas DataFrame."""
+    db = SessionLocal()
     try:
-        resp = sb.auth.sign_in_with_password({"email": email, "password": password})
-        user = resp.user
-        token = resp.session.access_token if resp.session else None
-        if not user:
-            return "Invalid credentials."
-        # fetch role from users table
-        prof = (
-            sb.table("users")
-            .select("*")
-            .eq("id", user.id)
-            .maybe_single()
-            .execute()
-        )
-        # if profile missing, create default candidate profile
-        if prof.data is None:
-            sb.table("users").insert(
-                {"id": user.id, "email": email, "full_name": "", "role": "candidate"}
-            ).execute()
-            role = "candidate"
-        else:
-            role = prof.data.get("role", "candidate")
-        st.session_state.auth = {
-            "user_id": user.id,
-            "email": email,
-            "role": role,
-            "access_token": token,
-        }
-        return None
+        users_query = db.query(User).all()
+        # Convert the list of User objects to a DataFrame
+        df = pd.DataFrame([u.__dict__ for u in users_query])
+        return df
+    finally:
+        db.close()
+
+def add_new_user(username, password_hash, role):
+    """Adds a new user to the database."""
+    db = SessionLocal()
+    try:
+        new_user = User(username=username, password_hash=password_hash, role=role)
+        db.add(new_user)
+        db.commit()
+    finally:
+        db.close()
+
+def load_progress():
+    """Loads all candidate progress data from the database into a pandas DataFrame."""
+    db = SessionLocal()
+    try:
+        # Use pandas to read directly from the SQL table for convenience
+        df = pd.read_sql(db.query(CandidateProgress).statement, db.bind)
+        return df
+    finally:
+        db.close()
+
+def add_candidate_progress(data_dict):
+    """Adds a new candidate application record to the database."""
+    db = SessionLocal()
+    try:
+        new_progress = CandidateProgress(**data_dict)
+        db.add(new_progress)
+        db.commit()
+    finally:
+        db.close()
+
+def update_progress(record_id, updates):
+    """Updates an existing candidate progress record in the database by its ID."""
+    db = SessionLocal()
+    try:
+        db.query(CandidateProgress).filter(CandidateProgress.id == record_id).update(updates)
+        db.commit()
+    finally:
+        db.close()
+
+# -------------------- Original Helper Functions (Unchanged) --------------------
+def hash_password(password):
+    return hashlib.sha256(password.encode()).hexdigest()
+
+def extract_text_from_pdf(file):
+    with pdfplumber.open(file) as pdf:
+        return "\n".join(page.extract_text() or "" for page in pdf.pages)
+
+def extract_text_from_docx(file):
+    doc = docx.Document(file)
+    return "\n".join(p.text for p in doc.paragraphs)
+
+def extract_name(text):
+    doc = nlp(text)
+    for ent in doc.ents:
+        if ent.label_ == "PERSON":
+            return ent.text.title()
+    # Fallback for simple names
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    if lines:
+        first_line = lines[0]
+        if len(first_line.split()) < 4: # Likely a name
+             return first_line.title()
+    return "Not found"
+
+def extract_email_from_text(text):
+    m = re.search(r'[\w\.-]+@[\w\.-]+', text)
+    return m.group(0) if m else "Not found"
+
+def extract_phone_from_text(text):
+    m = re.search(r'(\+?\d{1,3}[\s\-]?)?(\(?\d{2,5}\)?[\s\-]?)?\d{3,5}[\s\-]?\d{3,5}', text)
+    return m.group(0) if m else "Not found"
+
+def send_email_with_ics(to_email, subject, body, meeting_start=None, meeting_end=None):
+    if not to_email or to_email == "Not found":
+        st.error("❌ Email is blank, cannot send invite. Candidate auto-rejected.")
+        return False
+
+    msg = MIMEMultipart("mixed")
+    msg["From"] = SMTP_EMAIL
+    msg["To"] = to_email
+    msg["Subject"] = subject
+    msg.attach(MIMEText(body, "plain"))
+
+    if meeting_start and meeting_end:
+        ics_content = f"""BEGIN:VCALENDAR...""" # ICS content remains the same
+        part = MIMEBase("text", "calendar", method="REQUEST", name="invite.ics")
+        part.set_payload(ics_content)
+        encoders.encode_base64(part)
+        part.add_header("Content-Disposition", "attachment; filename=invite.ics")
+        msg.attach(part)
+
+    try:
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+            server.login(SMTP_EMAIL, SMTP_PASSWORD)
+            server.send_message(msg)
+        st.success(f"📨 Email sent to {to_email}")
+        return True
     except Exception as e:
-        return f"Sign-in error: {e}"
+        st.error(f"❌ Failed to send email: {e}")
+        return False
 
-def sign_up(email: str, password: str):
-    try:
-        resp = sb.auth.sign_up({"email": email, "password": password})
-        if not resp.user:
-            return "Sign-up failed."
-        # create profile row
-        sb.table("users").insert(
-            {"id": resp.user.id, "email": email, "full_name": "", "role": "candidate"}
-        ).execute()
-        return None
-    except Exception as e:
-        return f"Sign-up error: {e}"
+def logout_sidebar():
+    with st.sidebar:
+        st.markdown(f"👤 Logged in as `{st.session_state['username']}`")
+        if st.button("🚪 Logout", key="logout_btn"):
+            st.session_state.clear()
+            st.rerun()
 
-def sign_out():
-    try:
-        sb.auth.sign_out()
-    except Exception:
-        pass
-    st.session_state.auth = None
-
-# ---- UI: AUTH ----
-def auth_view():
-    st.title("🧾 Resume Analyzer")
-    tabs = st.tabs(["Sign In", "Sign Up", "About"])
+# -------------------- UI Sections (Updated to use new DB functions) --------------------
+def login_register_ui():
+    st.title("🔐 AI Resume Analyzer")
+    tabs = st.tabs(["🔑 Login", "🆕 Register"])
     with tabs[0]:
-        with st.form("signin"):
-            email = st.text_input("Email")
-            pw = st.text_input("Password", type="password")
-            submit = st.form_submit_button("Sign In")
-        if submit:
-            err = sign_in(email, pw)
-            if err:
-                st.error(err)
-            else:
-                st.success("Signed in.")
-                st.rerun()
-    with tabs[1]:
-        with st.form("signup"):
-            email = st.text_input("Email ", key="su_email")
-            pw = st.text_input("Password ", type="password", key="su_pw")
-            submit = st.form_submit_button("Create Account")
-        if submit:
-            err = sign_up(email, pw)
-            if err:
-                st.error(err)
-            else:
-                st.success("Account created. Please sign in.")
-    with tabs[2]:
-        st.markdown(
-            """
-**How it works**
-- Candidates upload a resume and (optionally) paste a job description.
-- We compute a quick keyword overlap score and save an application row.
-- HR can review applications and mark **Pass** (auto-advance stage) or **Fail** (Reject).
-- Candidates can see their current **phase** at any time.
-
-**Tables expected**
-- `users`: `id uuid (PK)`, `email text`, `full_name text`, `role text`
-- `applications`: `id uuid (PK)`, `user_id uuid`, `resume_text text`,
-  `job_id text`, `job_title text`, `job_description text`,
-  `match_score float8`, `phase text`, `created_at timestamptz`
-"""
-        )
-
-# ---- CANDIDATE VIEW ----
-def candidate_view():
-    st.sidebar.success(f"Logged in as {st.session_state.auth['email']} (candidate)")
-    st.sidebar.button("Sign out", on_click=sign_out)
-
-    st.header("📤 Submit your resume")
-    with st.form("resume_form", clear_on_submit=True):
-        job_title = st.text_input("Job Title (optional)")
-        job_id = st.text_input("Job ID / Requisition (optional)")
-        job_desc = st.text_area("Job Description (paste text; optional)", height=150)
-        file = st.file_uploader("Upload Resume (PDF/DOCX/TXT)", type=["pdf", "docx", "txt"])
-        submitted = st.form_submit_button("Submit Application")
-    if submitted:
-        if not file:
-            st.error("Please upload a resume file.")
-        else:
-            text = extract_text_from_file(file)
-            if not text.strip():
-                st.warning("Could not extract text from the file. You can still submit.")
-            score = simple_match_score(text, job_desc) if job_desc else 0.0
-            phase = "Applied"
-            row = {
-                "id": str(uuid.uuid4()),
-                "user_id": st.session_state.auth["user_id"],
-                "resume_text": text[:90000],  # safety cut
-                "job_id": job_id or None,
-                "job_title": job_title or None,
-                "job_description": (job_desc or "")[:90000],
-                "match_score": score,
-                "phase": phase,
-                "created_at": datetime.utcnow().isoformat(),
-            }
-            try:
-                sb.table("applications").insert(row).execute()
-                st.success(f"Application submitted. Initial phase: {phase}. Match score: {score}%")
-            except Exception as e:
-                st.error(f"Failed to save application: {e}")
-
-    st.divider()
-    st.subheader("🧭 Your applications & phases")
-    try:
-        apps = (
-            sb.table("applications")
-            .select("id, job_title, job_id, match_score, phase, created_at")
-            .eq("user_id", st.session_state.auth["user_id"])
-            .order("created_at", desc=True)
-            .execute()
-        )
-        if not apps.data:
-            st.info("No applications yet.")
-        else:
-            import pandas as pd
-            df = pd.DataFrame(apps.data)
-            st.dataframe(df, hide_index=True, use_container_width=True)
-    except Exception as e:
-        st.error(f"Failed to load applications: {e}")
-
-# ---- HR VIEW ----
-def hr_view():
-    st.sidebar.success(f"Logged in as {st.session_state.auth['email']} (HR)")
-    st.sidebar.button("Sign out", on_click=sign_out)
-
-    st.header("🧑‍💼 HR Review")
-    # Filters
-    colf1, colf2, colf3 = st.columns([2,2,1])
-    with colf1:
-        job_id_filter = st.text_input("Filter by Job ID (optional)")
-    with colf2:
-        stage_filter = st.selectbox("Filter by Phase", ["(all)"] + PIPELINE, index=0)
-    with colf3:
-        st.write("")
-        refresh = st.button("Reload")
-
-    # Load applications
-    q = sb.table("applications").select(
-        "id, user_id, job_title, job_id, match_score, phase, created_at"
-    )
-    if job_id_filter:
-        q = q.ilike("job_id", f"%{job_id_filter}%")
-    if stage_filter != "(all)":
-        q = q.eq("phase", stage_filter)
-    q = q.order("created_at", desc=True)
-
-    try:
-        apps = q.execute()
-    except Exception as e:
-        st.error(f"Failed to load applications: {e}")
-        return
-
-    if not apps.data:
-        st.info("No applications match your filters.")
-        return
-
-    # Map user_id -> email
-    user_ids = list({a["user_id"] for a in apps.data})
-    users = {}
-    try:
-        if user_ids:
-            resp = sb.table("users").select("id, email, full_name").in_("id", user_ids).execute()
-            for u in resp.data or []:
-                users[u["id"]] = u
-    except Exception:
-        pass
-
-    # Render rows with controls
-    for a in apps.data:
-        with st.container(border=True):
-            c1, c2, c3, c4, c5 = st.columns([3,2,1,1,2])
-            with c1:
-                st.markdown(
-                    f"**{a.get('job_title') or 'Untitled Role'}**  \n"
-                    f"Job ID: `{a.get('job_id') or '-'}`"
-                )
-                u = users.get(a["user_id"], {})
-                st.caption(f"Candidate: {u.get('full_name') or u.get('email') or a['user_id']}")
-            with c2:
-                st.metric("Match Score", f"{a.get('match_score', 0)}%")
-            with c3:
-                st.write("Phase")
-                st.code(a["phase"])
-            with c4:
-                st.write("Action")
-                # buttons need unique keys
-                pass_key = f"pass_{a['id']}"
-                fail_key = f"fail_{a['id']}"
-                advanced = st.button("Pass ➜", key=pass_key)
-                rejected = st.button("Fail ✖", key=fail_key)
-            with c5:
-                if st.button("View resume text", key=f"view_{a['id']}"):
-                    # fetch full row to show resume_text
-                    try:
-                        full = sb.table("applications").select("resume_text, job_description").eq("id", a["id"]).single().execute()
-                        with st.expander("Resume & Job Description", expanded=True):
-                            st.text_area("Resume (extracted)", full.data.get("resume_text") or "", height=200)
-                            st.text_area("Job Description", full.data.get("job_description") or "", height=150)
-                    except Exception as e:
-                        st.error(f"Load details failed: {e}")
-
-            # Handle actions
-            if "action_result" not in st.session_state:
-                st.session_state.action_result = None
-
-            if 'advanced' in locals() and advanced:
-                current = a["phase"]
-                if current in ("Hired", "Rejected"):
-                    st.warning("This application is final. No further advancement.")
+        username = st.text_input("👤 Username")
+        password = st.text_input("🔑 Password", type="password")
+        if st.button("Login"):
+            users = load_users()
+            hashed = hash_password(password)
+            if not users.empty:
+                user = users[(users["username"] == username) & (users["password_hash"] == hashed)]
+                if not user.empty:
+                    st.session_state["username"] = username
+                    st.session_state["role"] = user.iloc[0]["role"]
+                    st.success("Login successful!")
+                    st.rerun()
                 else:
-                    new_phase = ADVANCE_TARGET.get(current, "Interview")
-                    try:
-                        sb.table("applications").update({"phase": new_phase}).eq("id", a["id"]).execute()
-                        st.success(f"Advanced to **{new_phase}**.")
-                        st.session_state.action_result = True
-                    except Exception as e:
-                        st.error(f"Update failed: {e}")
+                    st.error("Invalid credentials.")
+            else:
+                st.error("Invalid credentials.")
+    with tabs[1]:
+        new_username = st.text_input("👤 Username", key="reg_user")
+        new_password = st.text_input("🔑 Password", type="password", key="reg_pass")
+        role = st.selectbox("Select Role", ["User", "HR"], key="reg_role")
+        if st.button("Register"):
+            users = load_users()
+            if new_username in users["username"].values:
+                st.warning("Username already registered.")
+            else:
+                # Use the new function to add user to the database
+                add_new_user(new_username, hash_password(new_password), role)
+                st.success("Registered successfully! Please login.")
 
-            if 'rejected' in locals() and rejected:
-                try:
-                    sb.table("applications").update({"phase": "Rejected"}).eq("id", a["id"]).execute()
-                    st.success("Marked as **Rejected**.")
-                    st.session_state.action_result = True
-                except Exception as e:
-                    st.error(f"Update failed: {e}")
+def user_view():
+    st.header("👤 Candidate Dashboard")
+    df_all = load_progress()
+    my_apps = df_all[df_all["logged_in_username"] == st.session_state["username"]]
+    st.subheader("📜 My Applications")
+    if not my_apps.empty:
+        # Display without the 'id' and 'logged_in_username' columns for a cleaner look
+        st.dataframe(my_apps.drop(columns=['id', 'logged_in_username'], errors='ignore'))
+    else:
+        st.info("You have not submitted any applications yet.")
 
-    if st.session_state.get("action_result"):
-        # redraw to show updated phases
-        st.session_state.action_result = None
-        st.rerun()
+    job_role = st.selectbox("Select a Job Role", options=list(job_descriptions.keys()))
+    company = st.selectbox("Select Company", options=list(job_descriptions[job_role].keys()))
 
-# ---- ROUTER ----
-def main():
-    st.sidebar.title("Resume Analyzer")
-    if not st.session_state.auth:
-        auth_view()
+    uploaded_file = st.file_uploader("Upload Resume (PDF or DOCX)", type=["pdf", "docx"])
+    if uploaded_file:
+        text = extract_text_from_pdf(uploaded_file) if uploaded_file.name.endswith(".pdf") else extract_text_from_docx(uploaded_file)
+        name = extract_name(text)
+        email_in_resume = extract_email_from_text(text)
+        phone = extract_phone_from_text(text)
+        
+        resume_keywords = extract_keywords(text)
+        jd_skills = job_descriptions[job_role][company]["skills"]
+        matched, missing, score = match_resume_to_job(resume_keywords, jd_skills)
+
+        phase = "Not Selected"
+        status = "Rejected"
+        if score >= 70:
+            phase = "Round 1 (Interview Pending Scheduling)"
+            status = "In Progress"
+
+        # Create a dictionary and use the new function to add it to the database
+        new_application = {
+            "logged_in_username": st.session_state["username"],
+            "email": email_in_resume,
+            "name": name,
+            "role": job_role,
+            "company": company,
+            "match_score": score,
+            "current_phase": phase,
+            "status": status
+        }
+        add_candidate_progress(new_application)
+
+        st.success(f"Application submitted for **{company} — {job_role}** (Score: {score}%)")
+        st.markdown(f"**Name:** {name}")
+        st.markdown(f"**Email:** {email_in_resume}")
+        st.markdown(f"**Phone:** {phone}")
+        st.markdown(f"**Status:** {status}")
+        st.info("Your application has been recorded. You can see its status in the 'My Applications' table above.")
+        st.button("Submit another application") # To help with rerunning the page
+
+def hr_view():
+    st.header("🏢 HR Dashboard")
+    df = load_progress()
+    if df.empty:
+        st.warning("No candidates have applied yet.")
         return
 
-    role = st.session_state.auth["role"]
-    if role == "hr":
+    st.subheader("All Candidates Overview")
+    
+    # Create a copy to avoid SettingWithCopyWarning
+    df_display = df.copy()
+    
+    # Use st.data_editor for interactive actions
+    for index, row in df_display.iterrows():
+        db_id = row['id'] # Get the unique database ID for this record
+        cols = st.columns([3, 2, 2, 2, 3, 2])
+        cols[0].write(f"**{row['name']}** ({row['email']})")
+        cols[1].write(f"{row['company']}")
+        cols[2].write(f"{row['role']}")
+        cols[3].write(f"{row['match_score']}%")
+        cols[4].write(row['current_phase'])
+        
+        # --- Actions Column ---
+        with cols[5]:
+            if "Pending Scheduling" in row["current_phase"] and row["status"] == "In Progress":
+                if st.button("📅 Schedule", key=f"sch_{db_id}"):
+                    # Logic to open a scheduling modal/form can be added here
+                    # For now, we'll just update the status
+                    update_progress(db_id, {"current_phase": row['current_phase'].replace("Pending Scheduling", "Scheduled")})
+                    st.rerun()
+
+            elif "Scheduled" in row["current_phase"]:
+                if st.button("✅ Pass", key=f"pass_{db_id}"):
+                    next_phase = "Selected" # Default
+                    if "Round 1" in row['current_phase']:
+                        next_phase = "Round 2 (Interview Pending Scheduling)"
+                    elif "Round 2" in row['current_phase']:
+                        next_phase = "Final (Interview Pending Scheduling)"
+                    
+                    update_progress(db_id, {"current_phase": next_phase})
+                    if next_phase == "Selected":
+                        update_progress(db_id, {"status": "Selected"})
+                        send_email_with_ics(row["email"], "🎉 Job Offer", f"Dear {row['name']},\n\nCongratulations! You are selected.")
+                    st.rerun()
+
+                if st.button("❌ Fail", key=f"fail_{db_id}"):
+                    update_progress(db_id, {"status": "Rejected", "current_phase": "Rejected"})
+                    st.rerun()
+            
+            elif row["status"] == "Selected":
+                st.write("🎉 Offer Sent")
+            
+            elif row["status"] == "Rejected":
+                st.write("❌ Rejected")
+
+
+# -------------------- Main Application Logic --------------------
+if "username" not in st.session_state:
+    login_register_ui()
+else:
+    logout_sidebar()
+    if st.session_state["role"] == "User":
+        user_view()
+    elif st.session_state["role"] == "HR":
         hr_view()
     else:
-        candidate_view()
+        st.error("Unknown role. Please contact support.")
 
-if __name__ == "__main__":
-    main()

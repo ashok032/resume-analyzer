@@ -1,5 +1,10 @@
-streamlit==1.38.0
-supabase==2.6.0
-PyPDF2==3.0.1
-python-docx==1.1.2
-pandas==2.2.2
+streamlit
+pandas
+pdfplumber
+python-docx
+spacy==3.7.2
+sqlalchemy
+psycopg2-binary
+
+# This next line is a special instruction to install the spaCy language model directly.
+https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.7.0/en_core_web_sm-3.7.0-py3-none-any.whl
