@@ -6,6 +6,8 @@ import docx
 import re
 import spacy
 import nltk
+from nltk.corpus import stopwords
+from nltk.tokenize import word_tokenize
 from sentence_transformers import SentenceTransformer, util
 from supabase import create_client, Client
 from datetime import datetime, timedelta
@@ -15,10 +17,10 @@ from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
 from email import encoders
 
-# -------------------- CONFIG --------------------
+# -------------------- PAGE CONFIG --------------------
 st.set_page_config(page_title="AI Resume Analyzer", layout="wide")
 
-# -------------------- SPAcy & NLTK --------------------
+# -------------------- SPAcy --------------------
 try:
     nlp = spacy.load("en_core_web_sm")
 except:
@@ -26,13 +28,21 @@ except:
     spacy.cli.download("en_core_web_sm")
     nlp = spacy.load("en_core_web_sm")
 
-nltk.download('punkt')
-nltk.download('stopwords')
+# -------------------- NLTK --------------------
+try:
+    stopwords.words("english")
+except LookupError:
+    nltk.download('punkt')
+    nltk.download('stopwords')
 
 # -------------------- SUPABASE --------------------
 SUPABASE_URL = st.secrets["SUPABASE_URL"]
 SUPABASE_KEY = st.secrets["SUPABASE_KEY"]
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+# -------------------- EMAIL --------------------
+SMTP_EMAIL = st.secrets.get("SMTP_EMAIL")
+SMTP_PASSWORD = st.secrets.get("SMTP_PASSWORD")
 
 # -------------------- HELPERS --------------------
 def hash_password(password):
@@ -69,9 +79,9 @@ def extract_phone_from_text(text):
     return m.group(0) if m else "Not found"
 
 def extract_keywords(text):
-    tokens = nltk.word_tokenize(text.lower())
-    stopwords = set(nltk.corpus.stopwords.words("english"))
-    return [t for t in tokens if t.isalpha() and t not in stopwords]
+    tokens = word_tokenize(text.lower())
+    stop_words = set(stopwords.words("english"))
+    return [t for t in tokens if t.isalpha() and t not in stop_words]
 
 def match_resume_to_job(resume_keywords, job_skills):
     model = SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')
@@ -85,10 +95,6 @@ def match_resume_to_job(resume_keywords, job_skills):
             missing.append(skill)
     score = round(len(matched)/len(job_skills)*100,2) if job_skills else 0
     return matched, missing, score
-
-# -------------------- EMAIL --------------------
-SMTP_EMAIL = st.secrets.get("SMTP_EMAIL")
-SMTP_PASSWORD = st.secrets.get("SMTP_PASSWORD")
 
 def send_email_with_ics(to_email, subject, body, meeting_start=None, meeting_end=None):
     if not to_email:
