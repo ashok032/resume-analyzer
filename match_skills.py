@@ -55,3 +55,10 @@ def match_skills(resume_skills, job_skills):
 
     score = (len(matched) / len(job_skills)) * 100 if job_skills else 0
     return matched, missing, round(score, 2)
+
+# ----------------------------
+# Wrapper for app.py
+# ----------------------------
+def match_resume_to_job(resume_text, job_skills):
+    resume_keywords = extract_keywords(resume_text)
+    return match_skills(resume_keywords, job_skills)
