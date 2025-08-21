@@ -1,64 +1,45 @@
+# match_skills.py
 import nltk
 from nltk.tokenize import word_tokenize
-from nltk.corpus import stopwords
-import re
 from sentence_transformers import SentenceTransformer, util
+import re
+import os
 
-# ----------------------------
-# Ensure required NLTK data
-# ----------------------------
-for pkg in ["punkt", "stopwords"]:
-    try:
-        if pkg == "punkt":
-            nltk.data.find("tokenizers/punkt")
-        else:
-            nltk.data.find(f"corpora/{pkg}")
-    except LookupError:
-        nltk.download(pkg)
+# Ensure punkt is available
+try:
+    nltk.data.find("tokenizers/punkt")
+except LookupError:
+    nltk.download("punkt")
 
-# ----------------------------
-# Initialize model
-# ----------------------------
-model = SentenceTransformer("all-MiniLM-L6-v2")
+model = SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')
 
-# ----------------------------
-# Extract keywords from resume
-# ----------------------------
 def extract_keywords(text):
     text = text.lower()
-    text = re.sub(r"[^a-zA-Z\s]", " ", text)  # remove special chars/numbers
     tokens = word_tokenize(text)
-    stop_words = set(stopwords.words("english"))
-    filtered_tokens = [word for word in tokens if word not in stop_words and len(word) > 1]
-    return list(set(filtered_tokens))  # unique keywords
+    tokens = [re.sub(r'\W+', '', token) for token in tokens if token.isalpha()]
+    return list(set(tokens))
 
-# ----------------------------
-# Match skills semantically
-# ----------------------------
-def match_skills(resume_skills, job_skills):
-    if not resume_skills or not job_skills:
-        return [], job_skills, 0.0
-
-    resume_embeddings = model.encode(resume_skills, convert_to_tensor=True)
-    job_embeddings = model.encode(job_skills, convert_to_tensor=True)
-
-    matched = []
-    missing = []
-
-    for i, job_skill in enumerate(job_skills):
-        sims = util.cos_sim(job_embeddings[i], resume_embeddings)[0]
-        best_score = sims.max().item()
-        if best_score > 0.6:  # similarity threshold
-            matched.append(job_skill)
-        else:
-            missing.append(job_skill)
-
-    score = (len(matched) / len(job_skills)) * 100 if job_skills else 0
-    return matched, missing, round(score, 2)
-
-# ----------------------------
-# Wrapper for app.py
-# ----------------------------
-def match_resume_to_job(resume_text, job_skills):
+def match_resume_to_job(resume_text, job_description):
     resume_keywords = extract_keywords(resume_text)
-    return match_skills(resume_keywords, job_skills)
+    job_keywords = extract_keywords(job_description)
+
+    if not resume_keywords or not job_keywords:
+        return 0.0, [], []
+
+    resume_embeddings = model.encode(resume_keywords, convert_to_tensor=True)
+    job_embeddings = model.encode(job_keywords, convert_to_tensor=True)
+
+    cosine_scores = util.cos_sim(resume_embeddings, job_embeddings)
+
+    matched_skills = []
+    missing_skills = []
+
+    for i, job_kw in enumerate(job_keywords):
+        max_score = max([cosine_scores[j][i].item() for j in range(len(resume_keywords))])
+        if max_score > 0.6:
+            matched_skills.append(job_kw)
+        else:
+            missing_skills.append(job_kw)
+
+    score = (len(matched_skills) / len(job_keywords)) * 100 if job_keywords else 0
+    return round(score, 2), matched_skills, missing_skills
