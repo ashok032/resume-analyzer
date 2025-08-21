@@ -1,40 +1,65 @@
-# match_skills.py
-
-from sentence_transformers import SentenceTransformer, util
+import re
+import nltk
 from nltk.corpus import stopwords
 from nltk.tokenize import word_tokenize
-import string
+from sentence_transformers import SentenceTransformer, util
 
-# Load model once
-model = SentenceTransformer('all-MiniLM-L6-v2')
-stop_words = set(stopwords.words('english'))
+# ✅ Ensure NLTK resources are available (prevents LookupError in deployment)
+try:
+    stop_words = set(stopwords.words('english'))
+except LookupError:
+    nltk.download('stopwords')
+    nltk.download('punkt')
+    stop_words = set(stopwords.words('english'))
+
+# ✅ Load sentence transformer model (semantic similarity)
+model = SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')
 
 def extract_keywords(text):
-    """Extract cleaned keywords from resume text."""
-    tokens = word_tokenize(text.lower())
-    tokens = [t for t in tokens if t.isalpha() and t not in stop_words]
-    return list(set(tokens))
+    """
+    Extract keywords from resume or job description text.
+    Removes stopwords, punctuation, and numbers.
+    """
+    text = text.lower()
+    tokens = word_tokenize(text)
+    keywords = [
+        word for word in tokens 
+        if word.isalpha() and word not in stop_words
+    ]
+    return list(set(keywords))
 
-def match_resume_to_job(resume_skills, job_skills, threshold=0.6):
-    """Compare resume skills to job skills using semantic similarity."""
-    if not resume_skills or not job_skills:
-        return [], job_skills, 0
+def match_resume_to_job(resume_text, job_description):
+    """
+    Match resume skills with job description using semantic similarity.
+    Returns:
+        - match_score (%)
+        - matched_skills (list)
+        - missing_skills (list)
+    """
+    resume_keywords = extract_keywords(resume_text)
+    job_keywords = extract_keywords(job_description)
 
-    # Encode in batch (much faster)
-    resume_emb = model.encode(resume_skills, convert_to_tensor=True)
-    job_emb = model.encode(job_skills, convert_to_tensor=True)
+    matched_skills = []
+    missing_skills = []
 
-    cosine_sim = util.cos_sim(job_emb, resume_emb)
+    if not job_keywords:
+        return 0, matched_skills, missing_skills
 
-    matched = []
-    missing = []
+    # Encode once for efficiency
+    resume_embeddings = model.encode(resume_keywords, convert_to_tensor=True)
+    job_embeddings = model.encode(job_keywords, convert_to_tensor=True)
 
-    for i, job_skill in enumerate(job_skills):
-        max_sim = float(cosine_sim[i].max())
-        if max_sim >= threshold:
-            matched.append(job_skill)
+    # Compute similarity matrix
+    cosine_scores = util.cos_sim(resume_embeddings, job_embeddings)
+
+    for i, job_kw in enumerate(job_keywords):
+        # Find the most similar resume word
+        best_match_idx = cosine_scores[:, i].argmax().item()
+        score = cosine_scores[best_match_idx, i].item()
+        if score > 0.6:  # threshold for semantic match
+            matched_skills.append(job_kw)
         else:
-            missing.append(job_skill)
+            missing_skills.append(job_kw)
 
-    score_percent = round(100 * len(matched) / len(job_skills)) if job_skills else 0
-    return matched, missing, score_percent
+    match_score = (len(matched_skills) / len(job_keywords)) * 100
+    return round(match_score, 2), matched_skills, missing_skills
