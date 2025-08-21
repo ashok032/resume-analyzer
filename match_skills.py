@@ -1,45 +1,47 @@
 # match_skills.py
-import nltk
-from nltk.tokenize import word_tokenize
-from sentence_transformers import SentenceTransformer, util
 import re
-import os
+from sentence_transformers import SentenceTransformer, util
 
-# Ensure punkt is available
-try:
-    nltk.data.find("tokenizers/punkt")
-except LookupError:
-    nltk.download("punkt")
+# load model once
+MODEL_NAME = "all-MiniLM-L6-v2"
+model = SentenceTransformer(MODEL_NAME)
 
-model = SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')
+def extract_keywords_simple(text: str) -> list:
+    """
+    Lightweight tokenizer: extract alpha tokens of length >=2, lowercase, unique.
+    """
+    if not text:
+        return []
+    tokens = re.findall(r"\b[a-zA-Z]{2,}\b", text.lower())
+    # remove common tiny words manually if desired (optional)
+    stopset = {"and","or","the","for","with","that","this","from","your","you","are","will","have","has","in","on","at"}
+    tokens = [t for t in tokens if t not in stopset]
+    return list(dict.fromkeys(tokens))  # preserve order unique
 
-def extract_keywords(text):
-    text = text.lower()
-    tokens = word_tokenize(text)
-    tokens = [re.sub(r'\W+', '', token) for token in tokens if token.isalpha()]
-    return list(set(tokens))
+def match_resume_to_job(resume_text: str, job_skills: list[str], threshold: float = 0.6):
+    """
+    resume_text: raw resume text
+    job_skills: list of skill strings (from DB)
+    returns: (score_percent, matched_skills_list, missing_skills_list)
+    """
+    resume_tokens = extract_keywords_simple(resume_text)
+    if not resume_tokens or not job_skills:
+        return 0.0, [], job_skills
 
-def match_resume_to_job(resume_text, job_description):
-    resume_keywords = extract_keywords(resume_text)
-    job_keywords = extract_keywords(job_description)
+    # encode tokens (resume tokens) and job_skills (as provided)
+    resume_emb = model.encode(resume_tokens, convert_to_tensor=True)
+    job_emb = model.encode(job_skills, convert_to_tensor=True)
 
-    if not resume_keywords or not job_keywords:
-        return 0.0, [], []
+    sims = util.cos_sim(resume_emb, job_emb)  # shape (len(resume_tokens), len(job_skills))
 
-    resume_embeddings = model.encode(resume_keywords, convert_to_tensor=True)
-    job_embeddings = model.encode(job_keywords, convert_to_tensor=True)
+    matched = []
+    for j_idx, job_skill in enumerate(job_skills):
+        # find best resume token sim for this job skill
+        best_sim = float(sims[:, j_idx].max())
+        if best_sim >= threshold:
+            matched.append(job_skill)
 
-    cosine_scores = util.cos_sim(resume_embeddings, job_embeddings)
-
-    matched_skills = []
-    missing_skills = []
-
-    for i, job_kw in enumerate(job_keywords):
-        max_score = max([cosine_scores[j][i].item() for j in range(len(resume_keywords))])
-        if max_score > 0.6:
-            matched_skills.append(job_kw)
-        else:
-            missing_skills.append(job_kw)
-
-    score = (len(matched_skills) / len(job_keywords)) * 100 if job_keywords else 0
-    return round(score, 2), matched_skills, missing_skills
+    matched = list(dict.fromkeys(matched))
+    missing = [s for s in job_skills if s not in matched]
+    score = round((len(matched) / len(job_skills)) * 100, 2) if job_skills else 0.0
+    return score, matched, missing
