@@ -1,361 +1,514 @@
 # app.py
 
+import os
+import re
+import hashlib
+from datetime import datetime
+
 import streamlit as st
 import pandas as pd
-import hashlib
+
+# Resume parsing deps
 import pdfplumber
 import docx
-import re
+
+# NLP
 import spacy
+
+# Email
 import smtplib
-import io
-import nltk
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from email.mime.base import MIMEBase
-from email import encoders
-from datetime import datetime
+
+# Supabase
 from supabase import create_client, Client
-from sentence_transformers import SentenceTransformer
-from match_skills import extract_keywords, match_resume_to_job # Your custom matching logic file
 
-# -------------------- NLTK DATA DOWNLOAD --------------------
-# This function checks for and downloads necessary NLTK data packages.
-# It's placed at the top to run once when the app starts.
-@st.cache_resource
-def download_nltk_data():
-    """Downloads NLTK 'stopwords' and 'punkt' corpora if not already present."""
-    try:
-        nltk.data.find('corpora/stopwords')
-    except LookupError:
-        st.write("Downloading NLTK 'stopwords'...")
-        nltk.download('stopwords')
-    try:
-        nltk.data.find('tokenizers/punkt')
-    except LookupError:
-        st.write("Downloading NLTK 'punkt'...")
-        nltk.download('punkt')
+# Skills matching (your file)
+from match_skills import extract_keywords, match_resume_to_job
 
-download_nltk_data()
 
-# -------------------- CONFIG AND INITIALIZATION --------------------
-st.set_page_config(page_title="AI Resume Analyzer", layout="wide", initial_sidebar_state="auto")
+# ==============================
+# CONFIG & CLIENTS
+# ==============================
 
-# Load NLP model using Streamlit's caching for efficiency
-@st.cache_resource
-def load_spacy_model():
-    """Load the spaCy model and cache it to avoid reloading on every run."""
-    try:
-        return spacy.load("en_core_web_sm")
-    except OSError:
-        st.error("spaCy model not found. Please ensure 'en_core_web_sm' is listed in your requirements.txt.")
-        st.stop()
+st.set_page_config(page_title="AI Resume Analyzer", layout="wide")
 
-# Cache the SentenceTransformer model to prevent re-downloading
-@st.cache_resource
-def load_sentence_transformer_model():
-    """Load and cache the SentenceTransformer model."""
-    return SentenceTransformer('all-MiniLM-L6-v2')
-
-nlp = load_spacy_model()
-model = load_sentence_transformer_model()
-
-# Initialize Supabase connection using secrets
+# Secrets (Streamlit)
 try:
     SUPABASE_URL = st.secrets["SUPABASE_URL"]
     SUPABASE_KEY = st.secrets["SUPABASE_KEY"]
-    supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-except KeyError:
-    st.error("🚨 **Error**: Supabase credentials not found. Please add `SUPABASE_URL` and `SUPABASE_KEY` to your Streamlit secrets.")
+    EMAIL_USER = st.secrets["EMAIL_USER"]
+    EMAIL_PASS = st.secrets["EMAIL_PASS"]
+except Exception as e:
+    st.error("Missing Streamlit secrets. Please set SUPABASE_URL, SUPABASE_KEY, EMAIL_USER, EMAIL_PASS in .streamlit/secrets.toml")
     st.stop()
 
-# Email credentials from secrets for sending notifications
-SMTP_EMAIL = st.secrets.get("SMTP_EMAIL", "")
-SMTP_PASSWORD = st.secrets.get("SMTP_PASSWORD", "")
+# Supabase client
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# -------------------- DATABASE HELPER FUNCTIONS --------------------
-
-@st.cache_data(ttl=600) # Cache job descriptions for 10 minutes
-def fetch_job_descriptions():
-    """Fetches all job roles and their associated skills from the Supabase 'job_descriptions' table."""
+# spaCy model (graceful fallback if not installed)
+def load_spacy():
     try:
-        response = supabase.table('job_descriptions').select('role, skills').execute()
-        if response.data:
-            # Create a dictionary mapping each role to its list of skills
-            return {item['role']: item['skills'] for item in response.data}
-        return {}
-    except Exception as e:
-        st.error(f"DB Error: Failed to fetch job descriptions. Details: {e}")
-        return {}
+        return spacy.load("en_core_web_sm")
+    except Exception:
+        # lightweight fallback: blank English pipeline
+        nlp_blank = spacy.blank("en")
+        return nlp_blank
 
-# -------------------- GENERAL HELPER FUNCTIONS --------------------
+nlp = load_spacy()
 
-def hash_password(password: str) -> str:
-    """Hashes a password using SHA256 for secure storage."""
-    return hashlib.sha256(password.encode()).hexdigest()
 
-def extract_text(file_bytes: io.BytesIO, file_name: str) -> str:
-    """Extracts text from PDF or DOCX files based on file extension."""
-    if file_name.endswith(".pdf"):
-        with pdfplumber.open(file_bytes) as pdf:
-            return "\n".join(page.extract_text() or "" for page in pdf.pages)
-    elif file_name.endswith(".docx"):
-        doc = docx.Document(file_bytes)
-        return "\n".join(p.text for p in doc.paragraphs)
-    return ""
+# ==============================
+# UTILS
+# ==============================
 
-def extract_name(text: str) -> str:
-    """Extracts a person's name from text using spaCy's NER, with a fallback."""
-    doc = nlp(text)
-    for ent in doc.ents:
-        if ent.label_ == "PERSON":
-            return ent.text.title()
-    # Fallback if NER fails
-    lines = [line.strip() for line in text.split('\n') if line.strip()]
-    if lines and len(lines[0].split()) in [2, 3]:
-        return lines[0].title()
-    return "Name Not Found"
-    
-def extract_email_from_text(text: str) -> str:
-    """Extracts an email address from text using regex."""
-    match = re.search(r'[\w\.-]+@[\w\.-]+', text)
-    return match.group(0) if match else "Email Not Found"
+def sha256_hash(password: str) -> str:
+    """Hash password with SHA-256 to match your existing DB schema."""
+    return hashlib.sha256(password.encode("utf-8")).hexdigest()
 
-def send_email(to_email: str, subject: str, body: str):
-    """Sends an email notification to a candidate."""
-    if not all([SMTP_EMAIL, SMTP_PASSWORD]):
-        st.error("Email credentials are not configured in secrets. Cannot send email.")
-        return False
-    if not to_email or to_email == "Email Not Found":
-        st.error("❌ Candidate email is blank, cannot send notification.")
-        return False
-
-    msg = MIMEMultipart()
-    msg["From"] = SMTP_EMAIL
-    msg["To"] = to_email
-    msg["Subject"] = subject
-    msg.attach(MIMEText(body, "plain"))
-
+def send_email(to_email: str, subject: str, body: str) -> None:
+    """Send email via Gmail (App Password recommended)."""
     try:
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-            server.login(SMTP_EMAIL, SMTP_PASSWORD)
-            server.send_message(msg)
-        st.success(f"📨 Email sent to {to_email}")
-        return True
+        msg = MIMEMultipart()
+        msg["From"] = EMAIL_USER
+        msg["To"] = to_email
+        msg["Subject"] = subject
+        msg.attach(MIMEText(body, "plain"))
+
+        server = smtplib.SMTP("smtp.gmail.com", 587)
+        server.starttls()
+        server.login(EMAIL_USER, EMAIL_PASS)
+        server.send_message(msg)
+        server.quit()
     except Exception as e:
-        st.error(f"❌ Failed to send email: {e}")
-        return False
+        st.warning(f"Email sending failed: {e}")
 
-# -------------------- UI COMPONENTS --------------------
+def extract_text_from_file(uploaded_file) -> str:
+    """Read PDF/DOCX to text. No file is stored anywhere."""
+    text = ""
+    if uploaded_file is None:
+        return text
 
-def logout_sidebar():
-    """Displays a logout button in the sidebar."""
-    with st.sidebar:
-        st.markdown(f"👤 Logged in as `{st.session_state['email']}`")
-        if st.button("🚪 Logout", key="logout_btn", use_container_width=True):
-            st.session_state.clear()
-            st.rerun()
-
-def login_register_ui():
-    """Handles the user login and registration UI."""
-    st.title("🔐 AI Resume Analyzer")
-    st.write("Please log in or register to continue.")
-    
-    tabs = st.tabs(["🔑 Login", "🆕 Register"])
-
-    with tabs[0]: # Login
-        with st.form("login_form"):
-            email = st.text_input("👤 Email")
-            password = st.text_input("🔑 Password", type="password")
-            submitted = st.form_submit_button("Login")
-            if submitted:
-                if not email or not password:
-                    st.warning("Please enter both email and password.")
-                    return
-                
-                hashed_pw = hash_password(password)
-                try:
-                    user_response = supabase.table('users').select('*').eq('email', email).eq('password_hash', hashed_pw).execute()
-                    if user_response.data:
-                        user = user_response.data[0]
-                        st.session_state["email"] = user['email']
-                        st.session_state["role"] = user['role']
-                        st.session_state["user_id"] = user['id']
-                        st.success("Login successful!")
-                        st.rerun()
-                    else:
-                        st.error("Invalid credentials. Please try again.")
-                except Exception as e:
-                    st.error(f"Login failed: {e}")
-
-    with tabs[1]: # Register
-        with st.form("register_form"):
-            new_email = st.text_input("👤 Email", key="reg_email")
-            new_password = st.text_input("🔑 Password", type="password", key="reg_pass")
-            role = st.selectbox("Select Role", ["User", "HR"], key="reg_role")
-            submitted = st.form_submit_button("Register")
-            if submitted:
-                if not all([new_email, new_password, role]):
-                    st.warning("Please fill all fields.")
-                    return
-
-                try:
-                    existing_user = supabase.table('users').select('id').eq('email', new_email).execute()
-                    if existing_user.data:
-                        st.warning("Email already registered. Please login.")
-                    else:
-                        new_user = {"email": new_email, "password_hash": hash_password(new_password), "role": role}
-                        supabase.table('users').insert(new_user).execute()
-                        st.success("Registered successfully! Please proceed to the Login tab.")
-                except Exception as e:
-                    st.error(f"Registration failed: {e}")
-
-# -------------------- USER (CANDIDATE) VIEW --------------------
-def user_view():
-    st.header("👤 Candidate Dashboard")
-
-    # Display My Applications
-    st.subheader("📜 My Applications")
-    try:
-        apps_response = supabase.table('applications').select('*').eq('user_id', st.session_state['user_id']).order('submission_date', desc=True).execute()
-        if apps_response.data:
-            df_apps = pd.DataFrame(apps_response.data)
-            # Ensure required columns exist, even if resume_url was removed from DB
-            if 'resume_url' in df_apps.columns:
-                 df_apps = df_apps.drop(columns=['resume_url'])
-            df_display = df_apps[['job_role', 'match_score', 'phase', 'submission_date']]
-            st.dataframe(df_display, use_container_width=True, hide_index=True)
-        else:
-            st.info("You have not submitted any applications yet.")
-    except Exception as e:
-        st.error(f"Could not load your applications: {e}")
-
-    # Submit New Application
-    st.subheader("🚀 Submit New Application")
-    job_descriptions_dict = fetch_job_descriptions()
-    if not job_descriptions_dict:
-        st.warning("No job roles are currently available. Please check back later.")
-        return
-
-    job_role = st.selectbox("Select a Job Role", options=list(job_descriptions_dict.keys()))
-    uploaded_file = st.file_uploader("Upload Your Resume (PDF or DOCX)", type=["pdf", "docx"])
-
-    if st.button("Analyze and Submit Application", disabled=(not uploaded_file or not job_role)):
-        with st.spinner("Analyzing resume and submitting application..."):
-            file_bytes = io.BytesIO(uploaded_file.getvalue())
-            text = extract_text(file_bytes, uploaded_file.name)
-            
-            resume_keywords = extract_keywords(text)
-            jd_skills = job_descriptions_dict[job_role]
-            matched, missing, score = match_resume_to_job(resume_keywords, jd_skills, model)
-
-            st.markdown(f"**Analysis Complete for '{job_role}' role:**")
-            st.metric(label="Match Score", value=f"{score:.2f}%")
-            st.info(f"**✅ Matched Skills:** {', '.join(matched) if matched else 'None'}")
-            st.warning(f"**❌ Missing Skills:** {', '.join(missing) if missing else 'None'}")
-
-            phase = "Screening" if score >= 60 else "Rejected"
-
-            # Insert application into database (WITHOUT resume URL)
-            try:
-                application_data = {
-                    "user_id": st.session_state['user_id'],
-                    "job_role": job_role,
-                    "match_score": score,
-                    "phase": phase
-                }
-                supabase.table('applications').insert(application_data).execute()
-                st.success("Application submitted successfully!")
-                st.balloons()
-            except Exception as e:
-                st.error(f"Failed to save application to database: {e}")
-
-# -------------------- HR VIEW --------------------
-def hr_view():
-    st.header("🏢 HR Dashboard")
-    try:
-        # Fetch applications and join with users table to get email
-        response = supabase.table('applications').select('*, users(email)').order('submission_date', desc=True).execute()
-        if not response.data:
-            st.warning("No candidate applications found.")
-            return
-        
-        candidates_df = pd.DataFrame(response.data)
-        candidates_df['email'] = candidates_df['users'].apply(lambda x: x['email'] if isinstance(x, dict) else 'N/A')
-        candidates_df = candidates_df.drop(columns=['users'])
-    except Exception as e:
-        st.error(f"Failed to load candidates: {e}")
-        return
-
-    # UI for HR dashboard
-    st.subheader("All Candidate Applications")
-    
-    # Filters
-    col1, col2 = st.columns(2)
-    job_roles = ["All"] + sorted(list(candidates_df['job_role'].unique()))
-    selected_role = col1.selectbox("Filter by Role", job_roles)
-    
-    phases = ["All"] + sorted(list(candidates_df['phase'].unique()))
-    selected_phase = col2.selectbox("Filter by Phase", phases)
-
-    filtered_df = candidates_df.copy()
-    if selected_role != "All":
-        filtered_df = filtered_df[filtered_df['job_role'] == selected_role]
-    if selected_phase != "All":
-        filtered_df = filtered_df[filtered_df['phase'] == selected_phase]
-
-    if filtered_df.empty:
-        st.info("No candidates match the current filters.")
-        return
-
-    # Display candidates
-    for index, row in filtered_df.iterrows():
-        app_id = row['id']
-        expander_title = f"**{row['email']}** | Role: {row['job_role']} | Score: {row['match_score']:.1f}% | Phase: **{row['phase']}**"
-        with st.expander(expander_title):
-            # REMOVED the resume link
-            st.markdown(f"**Submitted on:** {pd.to_datetime(row['submission_date']).strftime('%Y-%m-%d %H:%M')}")
-            
-            cols = st.columns((1, 1, 2))
-            
-            # Action buttons
-            if cols[0].button("✅ Advance", key=f"adv_{app_id}", help="Advance candidate to the next hiring stage"):
-                phase_map = {"Screening": "Round 1 Interview", "Round 1 Interview": "Round 2 Interview", "Round 2 Interview": "Offer"}
-                next_phase = phase_map.get(row['phase'], row['phase'])
-                if next_phase != row['phase']:
-                    try:
-                        supabase.table('applications').update({'phase': next_phase}).eq('id', app_id).execute()
-                        st.success(f"Advanced {row['email']} to {next_phase}")
-                        send_email(row['email'], f"Update on your application for {row['job_role']}", f"Hello,\n\nCongratulations! You have been advanced to the next stage: {next_phase}.\n\nWe will be in touch shortly with more details.\n\nBest regards,\nThe Hiring Team")
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"Update failed: {e}")
-
-            if cols[1].button("❌ Reject", key=f"rej_{app_id}", help="Reject candidate application"):
-                try:
-                    supabase.table('applications').update({'phase': 'Rejected'}).eq('id', app_id).execute()
-                    st.warning(f"Rejected {row['email']}")
-                    send_email(row['email'], f"Update on your application for {row['job_role']}", f"Hello,\n\nThank you for your interest in the {row['job_role']} role. After careful consideration, we have decided not to move forward with your application at this time.\n\nWe wish you the best in your job search.\n\nBest regards,\nThe Hiring Team")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Update failed: {e}")
-
-# -------------------- MAIN APP LOGIC --------------------
-def main():
-    """Main function to run the Streamlit app."""
-    if "email" not in st.session_state:
-        login_register_ui()
+    name = uploaded_file.name.lower()
+    if name.endswith(".pdf"):
+        with pdfplumber.open(uploaded_file) as pdf:
+            for page in pdf.pages:
+                text += (page.extract_text() or "") + "\n"
+    elif name.endswith(".docx"):
+        doc = docx.Document(uploaded_file)
+        for para in doc.paragraphs:
+            text += para.text + "\n"
     else:
-        logout_sidebar()
-        if st.session_state.get("role") == "User":
-            user_view()
-        elif st.session_state.get("role") == "HR":
-            hr_view()
-        else:
-            st.error("Unknown user role. Please log out and try again.")
-            if st.button("Force Logout"):
-                st.session_state.clear()
+        st.error("Unsupported file type. Please upload PDF or DOCX.")
+    return text
+
+def extract_contact_info(text: str):
+    """Extract name (best-effort), email, phone from resume text."""
+    # Email
+    email_match = re.search(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", text)
+    email = email_match.group(0) if email_match else None
+
+    # Phone
+    phone_match = re.search(r"\+?\d[\d\s\-()]{8,}\d", text)
+    phone = phone_match.group(0) if phone_match else None
+
+    # Name (NER if model has it; else heuristic = first non-empty line)
+    name = None
+    if "ner" in nlp.pipe_names:  # only if the small model loaded
+        doc = nlp(text)
+        for ent in doc.ents:
+            if ent.label_ == "PERSON":
+                name = ent.text.strip()
+                break
+    if not name:
+        for line in text.splitlines():
+            line = line.strip()
+            if line and len(line.split()) <= 5:  # short-ish line
+                name = line
+                break
+
+    return name, email, phone
+
+
+# ==============================
+# SUPABASE DATA ACCESS
+# ==============================
+
+# Users
+def register_user(email: str, password: str, role: str):
+    return supabase.table("users").insert({
+        "email": email,
+        "password_hash": sha256_hash(password),
+        "role": role
+    }).execute()
+
+def login_user(email: str, password: str):
+    hashed = sha256_hash(password)
+    res = supabase.table("users").select("*").eq("email", email).eq("password_hash", hashed).execute()
+    return res.data[0] if res.data else None
+
+# Jobs (merged table: id uuid, title, description, skills[])
+def get_jobs():
+    res = supabase.table("jobs").select("*").order("created_at", desc=True).execute()
+    return res.data or []
+
+def add_job(title: str, description: str, skills_list: list[str]):
+    return supabase.table("jobs").insert({
+        "title": title,
+        "description": description,
+        "skills": skills_list
+    }).execute()
+
+def update_job(job_id: str, title: str, description: str, skills_list: list[str]):
+    return supabase.table("jobs").update({
+        "title": title,
+        "description": description,
+        "skills": skills_list
+    }).eq("id", job_id).execute()
+
+def delete_job(job_id: str):
+    return supabase.table("jobs").delete().eq("id", job_id).execute()
+
+# Applications (assumes schema with job_id uuid; we also try fallback to job_role if needed)
+def save_application(user_id: int, job_id: str, match_score: float, phase: str):
+    """We DO NOT store the resume file/URL. Only metadata."""
+    # Preferred: applications with job_id
+    try:
+        return supabase.table("applications").insert({
+            "user_id": user_id,
+            "job_id": job_id,
+            "resume_url": "",           # explicitly empty to ensure no storage
+            "match_score": match_score,
+            "phase": phase,
+            "submission_date": datetime.utcnow().isoformat()
+        }).execute()
+    except Exception:
+        # Fallback for old schema with job_role TEXT (if migration not yet applied)
+        # Fetch job title for compatibility
+        job = supabase.table("jobs").select("title").eq("id", job_id).single().execute().data
+        job_role = job["title"] if job else ""
+        return supabase.table("applications").insert({
+            "user_id": user_id,
+            "job_role": job_role,
+            "resume_url": "",
+            "match_score": match_score,
+            "phase": phase,
+            "submission_date": datetime.utcnow().isoformat()
+        }).execute()
+
+def get_all_applications():
+    res = supabase.table("applications").select("*").order("submission_date", desc=True).execute()
+    return res.data or []
+
+def get_user_applications(user_id: int):
+    res = supabase.table("applications").select("*").eq("user_id", user_id).order("submission_date", desc=True).execute()
+    return res.data or []
+
+def update_application_phase(app_id: int, new_phase: str):
+    return supabase.table("applications").update({"phase": new_phase}).eq("id", app_id).execute()
+
+
+# ==============================
+# PHASE WORKFLOW
+# ==============================
+
+PHASES = [
+    "Not Selected",
+    "Round 1 Scheduled",
+    "Round 2 Scheduled",
+    "Final Round Scheduled",
+    "Offer Extended",
+    "Rejected"
+]
+
+def advance_phase(current_phase: str) -> str:
+    order = ["Round 1 Scheduled", "Round 2 Scheduled", "Final Round Scheduled", "Offer Extended"]
+    if current_phase not in order:
+        return current_phase
+    idx = order.index(current_phase)
+    if idx < len(order) - 1:
+        return order[idx + 1]
+    return "Offer Extended"
+
+def notify_phase_update(candidate_email: str, candidate_name: str | None, new_phase: str):
+    sal = candidate_name or "Candidate"
+    if new_phase == "Rejected" or new_phase == "Not Selected":
+        subject = "Application Update"
+        body = f"Dear {sal},\n\nThank you for applying. At this time, we are unable to proceed.\n\nRegards"
+    elif new_phase == "Round 1 Scheduled":
+        subject = "Interview Scheduled - Round 1"
+        body = f"Dear {sal},\n\nCongratulations! Your Round 1 interview has been scheduled.\n\nRegards"
+    elif new_phase == "Round 2 Scheduled":
+        subject = "Interview Scheduled - Round 2"
+        body = f"Dear {sal},\n\nGreat news! You have progressed to Round 2.\n\nRegards"
+    elif new_phase == "Final Round Scheduled":
+        subject = "Interview Scheduled - Final Round"
+        body = f"Dear {sal},\n\nYou have progressed to the Final Round.\n\nRegards"
+    elif new_phase == "Offer Extended":
+        subject = "Offer Extended"
+        body = f"Dear {sal},\n\nCongratulations! We are pleased to extend an offer.\n\nRegards"
+    else:
+        subject = "Application Update"
+        body = f"Dear {sal},\n\nYour application status is now: {new_phase}.\n\nRegards"
+
+    send_email(candidate_email, subject, body)
+
+
+# ==============================
+# SESSION
+# ==============================
+
+if "user" not in st.session_state:
+    st.session_state.user = None
+
+
+# ==============================
+# AUTH VIEWS
+# ==============================
+
+def show_auth():
+    tab_login, tab_register = st.tabs(["🔑 Login", "🆕 Register"])
+
+    with tab_login:
+        email = st.text_input("Email", key="login_email")
+        password = st.text_input("Password", type="password", key="login_pass")
+        if st.button("Login", type="primary"):
+            user = login_user(email, password)
+            if user:
+                st.session_state.user = user
+                st.rerun()
+            else:
+                st.error("Invalid credentials")
+
+    with tab_register:
+        reg_email = st.text_input("Email", key="reg_email")
+        reg_pass = st.text_input("Password", type="password", key="reg_pass")
+        role = st.selectbox("Role", ["User", "HR"], key="reg_role")
+        if st.button("Create account"):
+            if not reg_email or not reg_pass:
+                st.warning("Please enter email and password.")
+            else:
+                # unique email constraint handled by DB; show friendly message if duplicate
+                res = register_user(reg_email, reg_pass, role)
+                if getattr(res, "error", None):
+                    st.error(f"Registration failed: {res.error}")
+                else:
+                    st.success("Registered successfully. Please login.")
+
+
+# ==============================
+# USER PORTAL
+# ==============================
+
+def show_user_portal():
+    st.header("📄 Candidate Portal")
+
+    # Jobs
+    jobs = get_jobs()
+    if not jobs:
+        st.info("No jobs available yet. Please check back later.")
+        return
+
+    titles = [j["title"] for j in jobs]
+    selected_title = st.selectbox("Select a role", options=titles)
+    job = next((j for j in jobs if j["title"] == selected_title), None)
+
+    if job:
+        with st.expander("Job Details", expanded=True):
+            st.markdown(f"**Title:** {job['title']}")
+            st.markdown(f"**Description:** {job['description']}")
+            st.markdown("**Required Skills:** " + ", ".join(job.get("skills", [])))
+
+    uploaded = st.file_uploader("Upload your resume (PDF/DOCX)", type=["pdf", "docx"])
+
+    if uploaded and job:
+        # Parse in memory (NOT storing)
+        text = extract_text_from_file(uploaded)
+
+        # Extract contact
+        name, resume_email, phone = extract_contact_info(text)
+
+        # Extract keywords -> match to job skills
+        resume_skills = extract_keywords(text)
+        matched, missing, score = match_resume_to_job(resume_skills, job.get("skills", []))
+
+        st.subheader("Analysis")
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("Match Score", f"{score}%")
+        with col2:
+            st.metric("Matched Skills", str(len(matched)))
+        with col3:
+            st.metric("Missing Skills", str(len(missing)))
+
+        st.write("**Matched:**", ", ".join(matched) if matched else "—")
+        st.write("**Missing:**", ", ".join(missing) if missing else "—")
+        st.write("**Extracted Name:**", name or "—")
+        st.write("**Extracted Email:**", resume_email or "—")
+        st.write("**Phone:**", phone or "—")
+
+        # Submit application
+        if st.button("Submit Application", type="primary"):
+            phase = "Round 1 Scheduled" if score > 70 else "Not Selected"
+            # Save minimal metadata; NO resume persisted
+            res = save_application(
+                user_id=st.session_state.user["id"],
+                job_id=job["id"],
+                match_score=score,
+                phase=phase
+            )
+            if getattr(res, "error", None):
+                st.error(f"Failed to save application: {res.error}")
+            else:
+                # notify user via registered account email (not resume email to keep consistent)
+                notify_phase_update(
+                    candidate_email=st.session_state.user["email"],
+                    candidate_name=name,
+                    new_phase=phase
+                )
+                st.success("Application submitted.")
                 st.rerun()
 
-if __name__ == "__main__":
-    main()
+    # List user's applications
+    st.subheader("Your Applications")
+    my_apps = get_user_applications(st.session_state.user["id"])
+    if my_apps:
+        df = pd.DataFrame(my_apps)
+        st.dataframe(df, use_container_width=True, hide_index=True)
+    else:
+        st.info("You haven't submitted any applications yet.")
+
+
+# ==============================
+# HR PORTAL
+# ==============================
+
+def show_hr_portal():
+    st.header("👔 HR Portal")
+
+    # ---- Manage Jobs
+    st.subheader("Manage Jobs")
+    with st.expander("➕ Add Job", expanded=False):
+        title = st.text_input("Job Title")
+        desc = st.text_area("Job Description")
+        skills_csv = st.text_input("Skills (comma separated)", placeholder="Python, SQL, ML, NLP")
+        if st.button("Add Job"):
+            skills = [s.strip() for s in skills_csv.split(",") if s.strip()]
+            if not title or not desc or not skills:
+                st.warning("Please provide title, description, and at least one skill.")
+            else:
+                res = add_job(title, desc, skills)
+                if getattr(res, "error", None):
+                    st.error(f"Failed to add job: {res.error}")
+                else:
+                    st.success("Job added.")
+                    st.rerun()
+
+    jobs = get_jobs()
+    if jobs:
+        with st.expander("✏️ Edit / Delete Jobs", expanded=False):
+            job_map = {f"{j['title']}": j for j in jobs}
+            pick = st.selectbox("Select Job", list(job_map.keys()))
+            jsel = job_map[pick]
+            etitle = st.text_input("Title", value=jsel["title"])
+            edesc = st.text_area("Description", value=jsel["description"])
+            eskills = st.text_input("Skills (comma separated)", value=", ".join(jsel.get("skills", [])))
+            colA, colB = st.columns(2)
+            with colA:
+                if st.button("Update Job"):
+                    skills_list = [s.strip() for s in eskills.split(",") if s.strip()]
+                    res = update_job(jsel["id"], etitle, edesc, skills_list)
+                    if getattr(res, "error", None):
+                        st.error(f"Update failed: {res.error}")
+                    else:
+                        st.success("Job updated.")
+                        st.rerun()
+            with colB:
+                if st.button("Delete Job"):
+                    res = delete_job(jsel["id"])
+                    if getattr(res, "error", None):
+                        st.error(f"Delete failed: {res.error}")
+                    else:
+                        st.success("Job deleted.")
+                        st.rerun()
+    else:
+        st.info("No jobs found. Add one above.")
+
+    # ---- Applications
+    st.subheader("Applications")
+    apps = get_all_applications()
+    if not apps:
+        st.info("No applications yet.")
+        return
+
+    # Try to enrich with job titles if job_id present
+    jobs_by_id = {j["id"]: j for j in jobs}
+    for a in apps:
+        if "job_id" in a and a["job_id"]:
+            a["job_title"] = jobs_by_id.get(a["job_id"], {}).get("title", "")
+        elif "job_role" in a:
+            a["job_title"] = a.get("job_role", "")
+        else:
+            a["job_title"] = ""
+
+    df = pd.DataFrame(apps)
+    show_cols = [c for c in ["id", "user_id", "job_id", "job_title", "match_score", "phase", "submission_date"] if c in df.columns]
+    st.dataframe(df[show_cols], use_container_width=True, hide_index=True)
+
+    st.markdown("### Update Application Phase")
+    app_ids = [a["id"] for a in apps]
+    chosen_id = st.selectbox("Select Application ID", app_ids)
+    chosen = next(a for a in apps if a["id"] == chosen_id)
+
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.write(f"**Current Phase:** {chosen['phase']}")
+        st.write(f"**User ID:** {chosen['user_id']}")
+        st.write(f"**Job:** {chosen.get('job_title','')}")
+
+    with col2:
+        if st.button("Mark PASS ➜ Next Phase", key=f"pass_{chosen_id}"):
+            if chosen["phase"] in ["Not Selected", "Rejected", "Offer Extended"]:
+                st.warning("Cannot advance this application.")
+            else:
+                new_phase = advance_phase(chosen["phase"])
+                update_application_phase(chosen_id, new_phase)
+                # Email to account email on file
+                user_row = supabase.table("users").select("email").eq("id", chosen["user_id"]).single().execute().data
+                candidate_email = user_row["email"] if user_row else None
+                if candidate_email:
+                    notify_phase_update(candidate_email, None, new_phase)
+                st.success(f"Phase updated to {new_phase}")
+                st.rerun()
+
+    with col3:
+        if st.button("Mark FAIL ➜ Rejected", key=f"fail_{chosen_id}"):
+            update_application_phase(chosen_id, "Rejected")
+            # Email to account email on file
+            user_row = supabase.table("users").select("email").eq("id", chosen["user_id"]).single().execute().data
+            candidate_email = user_row["email"] if user_row else None
+            if candidate_email:
+                notify_phase_update(candidate_email, None, "Rejected")
+            st.success("Application marked as Rejected.")
+            st.rerun()
+
+
+# ==============================
+# MAIN
+# ==============================
+
+if st.session_state.user is None:
+    show_auth()
+else:
+    st.sidebar.markdown(f"**👤 {st.session_state.user['email']}**  \nRole: `{st.session_state.user['role']}`")
+    if st.sidebar.button("Logout"):
+        st.session_state.user = None
+        st.rerun()
+
+    role = st.session_state.user["role"]
+    if role == "User":
+        show_user_portal()
+    elif role == "HR":
+        show_hr_portal()
+    else:
+        st.warning("Unknown role. Please contact admin.")

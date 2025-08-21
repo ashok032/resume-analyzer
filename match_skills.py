@@ -1,75 +1,40 @@
 # match_skills.py
 
-import re
+from sentence_transformers import SentenceTransformer, util
 from nltk.corpus import stopwords
 from nltk.tokenize import word_tokenize
-from sentence_transformers import util
+import string
 
-# Load stop words once when the module is imported
+# Load model once
+model = SentenceTransformer('all-MiniLM-L6-v2')
 stop_words = set(stopwords.words('english'))
 
-def extract_keywords(text: str) -> list:
-    """
-    Extracts and cleans keywords from the resume text.
-    It tokenizes the text, converts to lowercase, removes stop words,
-    and filters for alphanumeric words.
-    """
-    if not text:
-        return []
-    
-    # Normalize text: convert to lowercase and remove non-alphanumeric characters
-    text = re.sub(r'[^\w\s]', '', text.lower())
-    
-    # Tokenize the text (split into words)
-    tokens = word_tokenize(text)
-    
-    # Remove stop words and non-alphabetic tokens, and filter by length
-    keywords = [
-        word for word in tokens 
-        if word.isalpha() and word not in stop_words and len(word) > 1
-    ]
-    
-    # Return unique keywords to avoid duplicates
-    return list(set(keywords))
+def extract_keywords(text):
+    """Extract cleaned keywords from resume text."""
+    tokens = word_tokenize(text.lower())
+    tokens = [t for t in tokens if t.isalpha() and t not in stop_words]
+    return list(set(tokens))
 
-def match_resume_to_job(resume_keywords: list, jd_skills: list, model) -> tuple:
-    """
-    Calculates the match score between resume keywords and job description skills.
-    
-    Args:
-        resume_keywords (list): A list of keywords extracted from the resume.
-        jd_skills (list): A list of required skills from the job description.
-        model: The pre-loaded SentenceTransformer model.
+def match_resume_to_job(resume_skills, job_skills, threshold=0.6):
+    """Compare resume skills to job skills using semantic similarity."""
+    if not resume_skills or not job_skills:
+        return [], job_skills, 0
 
-    Returns:
-        tuple: A tuple containing (matched_skills, missing_skills, match_score).
-    """
-    if not resume_keywords or not jd_skills:
-        return [], jd_skills, 0.0
+    # Encode in batch (much faster)
+    resume_emb = model.encode(resume_skills, convert_to_tensor=True)
+    job_emb = model.encode(job_skills, convert_to_tensor=True)
 
-    # Convert lists to sets for efficient operations
-    resume_skills_set = set(resume_keywords)
-    jd_skills_set = set(jd_skills)
+    cosine_sim = util.cos_sim(job_emb, resume_emb)
 
-    # Find direct matches (case-insensitive)
-    matched_skills = list(resume_skills_set.intersection(jd_skills_set))
-    missing_skills = list(jd_skills_set.difference(resume_skills_set))
+    matched = []
+    missing = []
 
-    # Calculate a score based on direct keyword matches
-    if not jd_skills_set:
-        return [], [], 100.0 # Or handle as an error case
-        
-    direct_match_score = (len(matched_skills) / len(jd_skills_set)) * 100
+    for i, job_skill in enumerate(job_skills):
+        max_sim = float(cosine_sim[i].max())
+        if max_sim >= threshold:
+            matched.append(job_skill)
+        else:
+            missing.append(job_skill)
 
-    # For a more advanced score, you could use the model to find semantic similarity
-    # between missing skills and the resume content, but for now, we'll rely on the direct match.
-    # Example for semantic similarity (can be added later):
-    #
-    # if missing_skills:
-    #     resume_text = " ".join(resume_keywords)
-    #     resume_embedding = model.encode(resume_text, convert_to_tensor=True)
-    #     missing_skills_embeddings = model.encode(missing_skills, convert_to_tensor=True)
-    #     cosine_scores = util.pytorch_cos_sim(resume_embedding, missing_skills_embeddings)
-    #     # Add logic to augment score based on high cosine similarity...
-
-    return matched_skills, missing_skills, direct_match_score
+    score_percent = round(100 * len(matched) / len(job_skills)) if job_skills else 0
+    return matched, missing, score_percent
